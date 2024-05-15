@@ -745,6 +745,7 @@ name = "zk-wordle"
 version = "0.1.0"
 dependencies = [
  "bellman",
+ "bincode",
  "bls12_381",
  "curve25519-dalek 4.1.2",
  "errors",

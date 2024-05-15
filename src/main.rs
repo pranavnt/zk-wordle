@@ -6,6 +6,9 @@ use rand::thread_rng;
 use std::fs::File;
 use std::io::{self, BufRead};
 
+use bincode;
+
+
 // Constants
 const NUM_DIGITS: usize = 5;
 const DIGIT_RANGE: usize = 26;
@@ -16,33 +19,45 @@ struct GameInputs {
     guess: Vec<u8>,
 }
 
-// Circuit outputs
 struct GameOutputs {
     letter_in_word: Vec<bool>,
     letter_correct: Vec<bool>,
 }
 
 // Circuit constraints
-fn game_constraints(_inputs: &GameInputs, outputs: &GameOutputs) -> Instance {
+fn game_constraints(inputs: &GameInputs, outputs: &GameOutputs) -> Instance {
+    let num_cons = NUM_DIGITS * 2;
+    let num_vars = NUM_DIGITS * 2;
+    let num_inputs = NUM_DIGITS * 2;
+    let num_non_zero_entries = NUM_DIGITS * 2;
+
     let mut A = Vec::new();
     let mut B = Vec::new();
     let mut C = Vec::new();
 
     for i in 0..NUM_DIGITS {
-        // Constraint: letter_in_word[i] = (guess[i] in hidden_word)
-        for j in 0..NUM_DIGITS {
-            A.push((i, j, Scalar::from(1u64).to_bytes()));
-            B.push((i, NUM_DIGITS + i, Scalar::from(1u64).to_bytes()));
-            C.push((i, NUM_DIGITS * 2 + i, Scalar::from(outputs.letter_in_word[i] as u64).to_bytes()));
+        let hidden_char = inputs.hidden_word[i] as usize;
+        let guess_char = inputs.guess[i] as usize;
+
+        A.push((i, hidden_char, Scalar::from(1u8).to_bytes()));
+        B.push((i, guess_char + DIGIT_RANGE, Scalar::from(1u8).to_bytes()));
+        C.push((i, i, Scalar::from(outputs.letter_in_word[i] as u8).to_bytes()));
+
+        A.push((i + NUM_DIGITS, hidden_char, Scalar::from(1u8).to_bytes()));
+        B.push((i + NUM_DIGITS, guess_char, Scalar::from(1u8).to_bytes()));
+        C.push((i + NUM_DIGITS, i + NUM_DIGITS, Scalar::from(outputs.letter_correct[i] as u8).to_bytes()));
+
+        // Replace Scalar::zero() with Scalar::from(0u8)
+        let mut vars = vec![Scalar::from(0u8).to_bytes(); num_vars];
+        for i in 0..NUM_DIGITS {
+            // Replace Scalar::one() with Scalar::from(1u8)
+            vars[inputs.hidden_word[i] as usize] = Scalar::from(1u8).to_bytes();
+            vars[inputs.guess[i] as usize + DIGIT_RANGE] = Scalar::from(1u8).to_bytes();
         }
 
-        // Constraint: letter_correct[i] = (guess[i] == hidden_word[i])
-        A.push((NUM_DIGITS + i, i, Scalar::from(1u64).to_bytes()));
-        B.push((NUM_DIGITS + i, NUM_DIGITS + i, Scalar::from(1u64).to_bytes()));
-        C.push((NUM_DIGITS + i, NUM_DIGITS * 3 + i, Scalar::from(outputs.letter_correct[i] as u64).to_bytes()));
     }
 
-    Instance::new(2 * NUM_DIGITS, 2 * NUM_DIGITS, 2 * NUM_DIGITS, &A, &B, &C).unwrap()
+    Instance::new(num_cons, num_vars, num_inputs, &A, &B, &C).unwrap()
 }
 
 // Helper function to convert Vec<u8> to [u8; 32]
@@ -59,43 +74,55 @@ fn prove_game(hidden_word: &[u8], guess: &[u8]) -> (Vec<u8>, Vec<bool>, Vec<bool
         guess: guess.to_vec(),
     };
 
-    let letter_in_word: Vec<bool> = guess.iter().map(|&d| hidden_word.contains(&d)).collect();
-    let letter_correct: Vec<bool> = hidden_word.iter().zip(guess).map(|(h, g)| h == g).collect();
+    let letter_in_word: Vec<bool> = inputs.hidden_word
+        .iter()
+        .map(|&h| inputs.guess.contains(&h))
+        .collect();
+
+    let letter_correct: Vec<bool> = inputs.hidden_word
+        .iter()
+        .zip(inputs.guess.iter())
+        .map(|(h, g)| h == g)
+        .collect();
 
     let outputs = GameOutputs {
         letter_in_word,
         letter_correct,
     };
 
-    let instance = game_constraints(&inputs, &outputs);
-
-    let num_vars = instance.inst.num_vars();
-    let num_cons = instance.inst.num_cons();
-    let num_inputs = instance.inst.num_inputs();
-    let num_non_zero_entries = instance.inst.num_non_zero_entries();
+    let inst = game_constraints(&inputs, &outputs);
+    let num_cons = NUM_DIGITS * 2;
+    let num_vars = NUM_DIGITS * 2;
+    let num_inputs = NUM_DIGITS * 2;
+    let num_non_zero_entries = NUM_DIGITS * 2;
 
     let gens = SNARKGens::new(num_cons, num_vars, num_inputs, num_non_zero_entries);
 
-    let vars_assignment = VarsAssignment::new(&[
-        vec_to_array_32(inputs.hidden_word.clone()),
-        vec_to_array_32(inputs.guess.clone()),
-        vec_to_array_32(outputs.letter_in_word.iter().map(|&b| b as u8).collect()),
-        vec_to_array_32(outputs.letter_correct.iter().map(|&b| b as u8).collect()),
-    ]).unwrap();
+    let (comm, decomm) = SNARK::encode(&inst, &gens);
 
-    let inputs_assignment = InputsAssignment::new(&[
-        vec_to_array_32(inputs.hidden_word.clone()),
-        vec_to_array_32(inputs.guess.clone()),
-    ]).unwrap();
+    let mut vars = vec![Scalar::from(0u8).to_bytes(); num_vars];
+    for i in 0..NUM_DIGITS {
+        // Replace Scalar::one() with Scalar::from(1u8)
+        vars[inputs.hidden_word[i] as usize] = Scalar::from(1u8).to_bytes();
+        vars[inputs.guess[i] as usize + DIGIT_RANGE] = Scalar::from(1u8).to_bytes();
+    }
 
-    let (comm, decomm) = SNARK::encode(&instance, &gens);
+    let assignment_vars = VarsAssignment::new(&vars).unwrap();
+    let assignment_inputs = InputsAssignment::new(&[vec_to_array_32(inputs.hidden_word.clone())]).unwrap();
 
-    let mut prover_transcript = Transcript::new(b"wordle_example");
-    let proof = SNARK::prove(&instance, &comm, &decomm, vars_assignment, &inputs_assignment, &gens, &mut prover_transcript);
 
-    let mut proof_bytes = Vec::new();
-    proof.write(&mut proof_bytes).unwrap();
+    let mut prover_transcript = Transcript::new(b"zk_wordle");
+    let proof = SNARK::prove(
+        &inst,
+        &comm,
+        &decomm,
+        assignment_vars,
+        &assignment_inputs,
+        &gens,
+        &mut prover_transcript,
+    );
 
+    let proof_bytes = bincode::serialize(&proof).unwrap();
     (proof_bytes, outputs.letter_in_word, outputs.letter_correct)
 }
 
@@ -106,30 +133,29 @@ fn verify_game(hidden_word: &[u8], guess: &[u8], proof_bytes: &[u8]) -> bool {
         guess: guess.to_vec(),
     };
 
-    let instance = game_constraints(&inputs, &GameOutputs {
+    let outputs = GameOutputs {
         letter_in_word: vec![false; NUM_DIGITS],
         letter_correct: vec![false; NUM_DIGITS],
-    });
+    };
 
-    let num_vars = instance.num_vars;
-    let num_cons = instance.num_cons;
-    let num_inputs = instance.num_inputs;
-    let num_non_zero_entries = instance.num_non_zero_entries();
+    let inst = game_constraints(&inputs, &outputs);
+    let num_cons = NUM_DIGITS * 2;
+    let num_vars = NUM_DIGITS * 2;
+    let num_inputs = NUM_DIGITS * 2;
+    let num_non_zero_entries = NUM_DIGITS * 2;
 
     let gens = SNARKGens::new(num_cons, num_vars, num_inputs, num_non_zero_entries);
 
-    let inputs_assignment = InputsAssignment::new(&[
-        vec_to_array_32(inputs.hidden_word.clone()),
-        vec_to_array_32(inputs.guess.clone()),
-    ]).unwrap();
+    let (comm, _) = SNARK::encode(&inst, &gens);
 
-    let (comm, _) = SNARK::encode(&instance, &gens);
+    let proof: SNARK = bincode::deserialize(proof_bytes).unwrap();
 
-    let mut proof = SNARK::empty();
-    proof.read(proof_bytes).unwrap();
+    let assignment_inputs = InputsAssignment::new(&[vec_to_array_32(inputs.hidden_word.clone())]).unwrap();
 
-    let mut verifier_transcript = Transcript::new(b"wordle_example");
-    proof.verify(&comm, &inputs_assignment, &mut verifier_transcript, &gens).is_ok()
+    let mut verifier_transcript = Transcript::new(b"zk_wordle");
+    proof
+        .verify(&comm, &assignment_inputs, &mut verifier_transcript, &gens)
+        .is_ok()
 }
 
 fn main() {
@@ -160,9 +186,10 @@ fn main() {
                 .expect("Failed to read line");
             input
         };
-        let guess_word: Vec<u8> = guess.trim().chars().map(|c| c as u8 - b'a').collect();
 
+        let guess_word: Vec<u8> = guess.trim().chars().map(|c| c as u8 - b'a').collect();
         let (proof_bytes, letter_in_word, letter_correct) = prove_game(&hidden_word, &guess_word);
+
         println!("Letter in word: {:?}", letter_in_word);
         println!("Letter correct: {:?}", letter_correct);
 
@@ -174,5 +201,6 @@ fn main() {
             break;
         }
     }
+
     println!("The word was {}", random_word);
 }
